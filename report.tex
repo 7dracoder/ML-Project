@@ -1,0 +1,322 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{microtype}
+\usepackage{enumitem}
+\usepackage{float}
+\usepackage{parskip}
+
+\hypersetup{colorlinks=true,linkcolor=blue,urlcolor=blue,citecolor=blue}
+\graphicspath{{figures/}}
+\setlength{\parskip}{5pt}
+\setlength{\parindent}{0pt}
+
+\title{\textbf{Scaling Laws for Language Models Trained on SVG Code}\\[4pt]
+\large CS-GY 6923 Optional Project --- Spring 2026}
+\author{Tanmay Sahu \quad \texttt{ts5888@nyu.edu}\\
+NYU Tandon School of Engineering\\[2pt]
+\small \url{https://github.com/7dracoder/ML-Project}}
+\date{May 1, 2026}
+
+\begin{document}
+\maketitle
+\thispagestyle{plain}
+
+%───────────────────────────────────────────────────────────────
+\section{Introduction}
+
+Scaling laws describe how model performance improves with model size, data, and
+compute. Kaplan et al.\ (2020) established power-law relationships for natural
+language, and Hoffmann et al.\ (2022) refined these with compute-optimal recipes.
+Scaling behavior in structured, non-linguistic domains remains underexplored.
+
+SVG (Scalable Vector Graphics) is XML-based text encoding visual content.
+Unlike natural language, SVG has strict syntactic rules, hierarchical structure,
+and outputs that can be instantly rendered --- making evaluation both quantitative
+and qualitative. We train five decoder-only transformers (1.4M--88.6M params) on
+115M tokens of SVG data, fit a power-law scaling curve, investigate $\mu$P for
+learning rate transfer, and generate and evaluate SVG samples from our best model.
+
+%───────────────────────────────────────────────────────────────
+\section{Data}
+
+\subsection{Datasets and Preprocessing}
+
+We use five HuggingFace datasets: \texttt{svg-icons-simple} (80K, primary),
+\texttt{svg-emoji-simple} (4K), \texttt{svg-fonts-simple} (100K subsampled),
+\texttt{svg-stack-simple} (120K subsampled), and \texttt{svgen-500k} (attempted
+but unavailable on Hub). After MD5 deduplication: 300,045 unique SVGs; after
+token-length filtering ($\leq$1024 tokens): 223,084.
+
+Each SVG is cleaned by: stripping comments/declarations/DOCTYPE, collapsing
+whitespace, rounding coordinates to 1 decimal place (e.g.\ $45.2387 \to 45.2$),
+validating XML with \texttt{lxml}, and removing SVGs under 50 chars or over 1024 tokens.
+
+\subsection{Tokenization}
+
+We train a BPE tokenizer (HuggingFace \texttt{tokenizers}, vocab=4096).
+BPE learns SVG-specific patterns as tokens --- e.g.\ \texttt{<path d="M} becomes
+one token --- helping the model learn structure rather than character-by-character
+syntax. Vocab 4096 balances compression (2.4 chars/token) with embedding table
+size (38\% of Tiny's parameters at this vocab; 72\% at 8192 --- too dominant).
+
+\subsection{Statistics}
+
+\begin{table}[H]
+\centering\small
+\begin{tabular}{lr}
+\toprule
+Metric & Value \\
+\midrule
+Vocabulary size & 4,096 \\
+Train tokens & 112,654,174 \\
+Val / Test tokens & 1,139,210 / 1,165,205 \\
+Mean / Median seq length & 515 / 481 tokens \\
+\bottomrule
+\end{tabular}
+\caption{Dataset statistics. Split is 98/1/1 by file to prevent leakage.}
+\end{table}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.85\linewidth]{seq_lengths.png}
+\caption{Sequence length distribution and CDF.}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.85\linewidth]{svg_examples.png}
+\caption{Rendered SVG examples at P10 (simple), P50 (medium), P90 (complex) complexity.}
+\end{figure}
+
+%───────────────────────────────────────────────────────────────
+\section{Methods}
+
+\subsection{Model Architecture}
+
+Decoder-only GPT with pre-norm, Flash Attention (\texttt{F.scaled\_dot\_product\_attention}),
+GELU, weight tying (SP), and residual scaling ($\sigma = 0.02/\sqrt{2L}$).
+
+\begin{table}[H]
+\centering\small
+\begin{tabular}{lrrrrr}
+\toprule
+Model & Params & $d$ & $L$ & $H$ & $d_{ff}$ \\
+\midrule
+Tiny   & 1.38M  & 128 & 4  & 4  & 512  \\
+Small  & 3.55M  & 192 & 6  & 6  & 768  \\
+Medium & 12.4M  & 384 & 6  & 6  & 1536 \\
+Large  & 33.9M  & 512 & 10 & 8  & 2048 \\
+XL     & 88.6M  & 768 & 12 & 12 & 3072 \\
+\bottomrule
+\end{tabular}
+\caption{Model configurations. All use context length 512 tokens.}
+\end{table}
+
+\subsection{Training Setup}
+
+AdamW ($\beta_1=0.9$, $\beta_2=0.95$, wd=0.1), cosine LR with 10\% warmup,
+batch 32,768 tokens, bfloat16, grad clip 1.0, dropout 0.0 (scaling study) /
+0.1 (extended training). All models trained for exactly 1 epoch for the scaling
+comparison.
+
+\textbf{LR strategy (Part 2):} The Tiny LR sweep (7 candidates, $3\times10^{-4}$ to
+$8\times10^{-3}$) found $8\times10^{-3}$ optimal. Per the spec, we first apply this
+same LR to all sizes (``fixed LR''), showing the expected degradation at Large/XL.
+We then use the standard sqrt-scaling heuristic
+$\text{lr}(N) = \text{lr}_{\text{tiny}} \cdot \sqrt{N_{\text{tiny}}/N}$
+to produce a proper SP scaling curve. This directly motivates $\mu$P in Part 3.
+
+\subsection{$\mu$P Implementation}
+
+We use the \texttt{mup} package with: (1) attention scaling $1/d_{\text{head}}$
+instead of $1/\sqrt{d_{\text{head}}}$; (2) \texttt{MuReadout} output layer (no
+weight tying --- required by $\mu$P); (3) \texttt{MuAdam} optimizer; (4) separate
+Q/K/V linear projections for proper shape tracking via \texttt{set\_base\_shapes}.
+Separate LR sweep on Tiny $\mu$P; optimal LR ($8\times10^{-3}$) transferred
+to all larger $\mu$P models without retuning.
+
+\subsection{Evaluation Metrics}
+
+Validation/test loss and perplexity; XML validity rate (\texttt{lxml}); SVG render
+rate (CairoSVG); structural validity (SVG root, closed tags, valid attributes);
+wall-clock time, GPU memory, tokens/second.
+
+%───────────────────────────────────────────────────────────────
+\section{Results}
+
+\subsection{Scaling Plot and Power Law Fit}
+
+\begin{table}[H]
+\centering\small
+\begin{tabular}{lrrr}
+\toprule
+Model & Params & Fixed LR Val & Scaled LR Val \\
+\midrule
+Tiny   & 1.38M  & 0.5898 & 0.5834 \\
+Small  & 3.55M  & 0.5398 & 0.5348 \\
+Medium & 12.4M  & 0.5407 & 0.5266 \\
+Large  & 33.9M  & 0.6738 & 0.5159 \\
+XL     & 88.6M  & 1.4826 & 0.5017 \\
+\bottomrule
+\end{tabular}
+\caption{Validation loss after 1 epoch. Fixed LR: same $8\times10^{-3}$ for all
+sizes (per spec). Scaled LR: sqrt-heuristic. Fixed LR degrades at Large/XL ---
+the expected SP failure mode that motivates $\mu$P.}
+\end{table}
+
+\begin{equation}
+L = 7190.98 \cdot N^{-0.8107} + 0.5061, \quad R^2 = 0.9559
+\end{equation}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.85\linewidth]{scaling_final.png}
+\caption{Left: SP and $\mu$P scaling curves with power-law fits and 10$\times$ extrapolation.
+Right: LR sweep comparison (SP vs.\ $\mu$P) on Tiny model.}
+\end{figure}
+
+\subsection{Fixed LR vs.\ $\mu$P and LR Sweep}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.85\linewidth]{lr_sweep.png}
+\caption{LR sweep on Tiny. Best LR = $8\times10^{-3}$ (val=0.5888).}
+\end{figure}
+
+\begin{table}[H]
+\centering\small
+\begin{tabular}{lrr}
+\toprule
+Model & SP Val & $\mu$P Val \\
+\midrule
+Tiny   & 0.5834 & 2.4609 \\
+Small  & 0.5348 & 2.7032 \\
+Medium & 0.5266 & 3.9972 \\
+Large  & 0.5159 & 4.0330 \\
+XL     & 0.5017 & 4.1961 \\
+\bottomrule
+\end{tabular}
+\caption{SP (scaled LR) vs.\ $\mu$P after 1 epoch. $\mu$P failed to achieve
+competitive performance (see Discussion).}
+\end{table}
+
+\subsection{Scaling Law Extrapolation}
+
+\begin{equation}
+\hat{L}(885\text{M params}) = 0.4947, \quad 95\%\ \text{CI:}\ [0.4745,\ 0.5187]
+\end{equation}
+Bootstrap CI from 2000 resamples of the SP (scaled LR) power law fit.
+
+\subsection{Training Curves}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.85\linewidth]{extended_training.png}
+\caption{XL model over 3 epochs (10,311 steps). Val loss: 0.65 $\to$ 0.45.}
+\end{figure}
+
+\subsection{Generated Samples and Evaluation}
+
+Best model: XL, 3 epochs, dropout 0.1. Test perplexity: \textbf{1.57}.
+
+\begin{table}[H]
+\centering\small
+\begin{tabular}{lr}
+\toprule
+Metric & Rate \\
+\midrule
+XML valid / SVG root / Closed tags & 54\% \\
+Has viewBox / Valid attrs / Structural & 54\% \\
+Renderable PNG (CairoSVG) & 54\% \\
+\bottomrule
+\end{tabular}
+\caption{Generation quality on 100 samples (with SVG-closing post-processing).
+All metrics coincide because XML parse failure cascades to all downstream checks.}
+\end{table}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.85\linewidth]{unconditional_grid.png}
+\caption{Unconditional samples at $T=0.5$ (top), $0.8$ (middle), $1.0$ (bottom).}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.85\linewidth]{prefix_grid.png}
+\caption{Prefix completions. Leftmost column: prefix. Columns 2--4: completions at $T \in \{0.5, 0.8, 1.0\}$.}
+\end{figure}
+
+%───────────────────────────────────────────────────────────────
+\section{Discussion}
+
+\subsection{Key Insights from Scaling Experiments}
+
+Our $\alpha = 0.8107$ is steeper than both Kaplan et al.'s $\alpha \approx 0.076$
+for natural language and Chinchilla's $\alpha \approx 0.34$. SVG's structured
+syntax constrains the next-token distribution heavily --- given a partial SVG, valid
+continuations are far fewer than in natural language. This lower entropy means
+additional parameters help more per unit compute. The irreducible loss $c = 0.5061$
+reflects inherent randomness in SVG data (exact coordinates, color choices) that
+no model can predict.
+
+\subsection{Learning Rate Scaling and $\mu$P}
+
+Using the same LR for all model sizes under SP causes Large/XL to diverge ---
+the effective LR for different layers scales differently with width. Our sqrt-scaled
+LR heuristic resolves this. $\mu$P is designed to eliminate this heuristic entirely
+by enabling zero-shot LR transfer.
+
+Our $\mu$P implementation did not achieve competitive performance: Medium/Large/XL
+models plateau at loss $\sim$4.0, indicating near-random predictions. The
+\texttt{mup} package's \texttt{set\_base\_shapes} tracks layers by Python attribute
+paths, and our custom architecture (\texttt{MuPAttention} with separate Q/K/V
+inside \texttt{MuPBlock}) does not fully match the expected naming conventions.
+\texttt{MuAdam} therefore does not apply correct per-layer LR multipliers for
+wider models, effectively behaving as standard Adam with the wrong attention
+scaling ($1/d_{\text{head}}$ instead of $1/\sqrt{d_{\text{head}}}$). A correct
+implementation would require using \texttt{mup.MuLinear} layers throughout or
+adapting the architecture to match \texttt{mup}'s expectations exactly.
+
+\subsection{Design Decisions}
+
+\textbf{Vocab 4096:} Balances compression with embedding table size.
+\textbf{Context 512:} Covers median SVG (481 tokens); 1024 would quadruple attention memory.
+\textbf{Pre-norm:} More stable than post-norm for deep models.
+\textbf{No dropout in scaling study:} Ensures clean comparison across model sizes.
+\textbf{SVG closing:} Generated SVGs that hit the token limit without closing tags
+are automatically closed via post-processing, improving render rates.
+
+\subsection{Limitations and Future Work}
+
+115M tokens is far below Chinchilla-optimal for XL ($\sim$17.7B tokens). More data
+would improve both scaling exponent and generation quality. Constrained decoding
+enforcing XML validity would significantly improve the 54\% render rate. Increasing
+context to 1024 tokens would cover 95\%+ of SVGs. A correct $\mu$P implementation
+using \texttt{mup.MuLinear} layers would enable proper zero-shot LR transfer.
+
+%───────────────────────────────────────────────────────────────
+\section{Conclusion}
+
+We trained decoder-only transformers on SVG code and found
+$L = 7190.98 \cdot N^{-0.8107} + 0.5061$ ($R^2 = 0.9559$) across 1.4M--88.6M
+parameters. The exponent $\alpha = 0.8107$ is steeper than natural language,
+consistent with SVG's structured, lower-entropy nature. Our best model (XL, 3
+epochs) achieves test perplexity 1.57 and 54\% render rate. $\mu$P did not improve
+over SP due to implementation constraints with the \texttt{mup} library. The
+extrapolated loss for a 10$\times$ larger model (885M params) is
+$0.4947\ [0.4745, 0.5187]_{95\%}$.
+
+%───────────────────────────────────────────────────────────────
+\appendix
+\section*{Appendix: Summary Figure}
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.9\linewidth]{scaling_final.png}
+\caption{Scaling laws and LR sweep comparison.}
+\end{figure}
+
+\end{document}

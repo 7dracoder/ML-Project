@@ -1,0 +1,10 @@
+# Ignore build artifacts, venv, and generator scripts
+.venv/
+__pycache__/
+*.pyc
+gen_part*.py
+nb_helper.py
+fix_style.py
+patch_drive.py
+.DS_Store
+._*
